@@ -1,0 +1,179 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from a2c_ppo_acktr.algo.kfac import KFACOptimizer
+import cv2
+import numpy
+import copy
+
+class A2C_ACKTR():
+    def __init__(self,
+                 actor_critic,
+                 value_loss_coef,
+                 entropy_coef,
+                 lr=None,
+                 eps=None,
+                 alpha=None,
+                 max_grad_norm=None,
+                 acktr=False):
+
+        self.actor_critic = actor_critic
+        self.acktr = acktr
+
+        self.value_loss_coef = value_loss_coef
+        self.entropy_coef = entropy_coef
+
+        self.max_grad_norm = max_grad_norm
+
+        if acktr:
+            self.optimizer = KFACOptimizer(actor_critic)
+        else:
+            self.optimizer = optim.RMSprop(
+                actor_critic.parameters(), lr, eps=eps, alpha=alpha)
+
+    def update(self, rollouts):
+        obs_shape = rollouts.obs.size()[2:]
+        action_shape = rollouts.actions.size()[-1]
+        num_steps, num_processes, _ = rollouts.rewards.size()
+
+        values, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(
+            rollouts.obs[:-1].view(-1, *obs_shape),
+            rollouts.recurrent_hidden_states[0].view(
+                -1, self.actor_critic.recurrent_hidden_state_size),
+            rollouts.masks[:-1].view(-1, 1),
+            rollouts.actions.view(-1, action_shape))
+
+        values = values.view(num_steps, num_processes, 1)
+        action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
+
+        advantages = rollouts.returns[:-1] - values
+        value_loss = advantages.pow(2).mean()
+
+        action_loss = -(advantages.detach() * action_log_probs).mean()
+
+        if self.acktr and self.optimizer.steps % self.optimizer.Ts == 0:
+            # Compute fisher, see Martens 2014
+            self.actor_critic.zero_grad()
+            pg_fisher_loss = -action_log_probs.mean()
+
+            value_noise = torch.randn(values.size())
+            if values.is_cuda:
+                value_noise = value_noise.to(values.device)
+
+            sample_values = values + value_noise
+            vf_fisher_loss = -(values - sample_values.detach()).pow(2).mean()
+
+            fisher_loss = pg_fisher_loss + vf_fisher_loss
+            self.optimizer.acc_stats = True
+            fisher_loss.backward(retain_graph=True)
+            self.optimizer.acc_stats = False
+
+        self.optimizer.zero_grad()
+        (value_loss * self.value_loss_coef + action_loss -
+         dist_entropy * self.entropy_coef).backward(retain_graph = True)
+
+        if self.acktr == False:
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(),
+                                     self.max_grad_norm)
+
+        self.optimizer.step()
+
+        return value_loss.item(), action_loss.item(), dist_entropy.item()
+
+
+
+
+
+
+    def saliency(self, rollouts,L,trigger_size): #compute saliency map for the first 30 step 
+        roll =copy.deepcopy(rollouts)
+        obs_shape = roll.obs.size()[2:]
+        action_shape = roll.actions.size()[-1]
+        num_steps, num_processes, _ = roll.rewards.size()
+
+        input_image = roll.obs[:-1].view(-1, *obs_shape)
+        input_image.requires_grad_()
+        # input_image.retain_grad()
+
+        values, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(
+            input_image,
+            roll.recurrent_hidden_states[0].view(
+                -1, self.actor_critic.recurrent_hidden_state_size),
+            roll.masks[:-1].view(-1, 1),
+            roll.actions.view(-1, action_shape))
+        values = values.view(num_steps, num_processes, 1)
+        action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
+        advantages = roll.returns[:-1] - values
+        value_loss = advantages.pow(2).mean()
+        action_loss = -(advantages.detach() * action_log_probs).mean()
+        action_loss.backward()
+        # value_loss.backward()
+        # print('shape of grad', input_image.grad.data.shape)
+        saliency= input_image.grad.data.abs()*255
+        # print('saliency',saliency)
+        # import pdb;pdb.set_trace()
+        unfold = torch.nn.Unfold(trigger_size,1,0,1)
+        # print('shape of saliency', saliency[0,0,:,:].sum(0).sum(0))
+        # print('min max of image and saliency',input_image.min(),input_image.max(),saliency.min(),saliency.max())
+        # cv2.imwrite('saliency_1.jpg',saliency[0,0,:,:].detach().cpu().numpy())
+        cv2.imwrite('sa_img.jpg',input_image[0,0,:,:].detach().cpu().numpy())
+        torch.save(saliency[0,0,:,:].detach().cpu(),'./salency.pt')
+        # print('column max', saliency[0,0,:,:].max(dim=0))
+        for i in range(80):
+            for j in range(4):
+                # print('rollouts_q_a.shape',roll.q_a.size())
+                # if roll.q_a[(i)//16,i%16]==1:
+                m = saliency[i,j,:,:]
+                m = m.unsqueeze(0).unsqueeze(1)
+                obs_un = unfold(m)
+                obs_sum = obs_un.sum(1)
+                m = obs_sum.max(dim=1).indices
+                # print('m value', m)
+                # import pdb;pdb.set_trace()
+                # print('argmax max', amx, amx%84)
+                # L.append([float(row),float(col-1)])
+                L.append(float(m))
+
+        return action_loss.item(), dist_entropy.item(),L
+
+
+
+    def obs_action_grad(self,rollouts):
+        # roll =rollouts
+        obs_shape = rollouts.obs.size()[2:]
+        action_shape = rollouts.actions.size()[-1]
+        num_steps, num_processes, _ = rollouts.rewards.size()
+        # import pdb;pdb.set_trace()
+        rollouts.obs.requires_grad_()
+        rollouts.obs.retain_grad()
+        input_image = rollouts.obs[:-1].view(-1, *obs_shape)
+        input_image.requires_grad_()
+        input_image.retain_grad()
+
+        values, action_log_probs, dist_entropy, rnn, dist = self.actor_critic.evaluate_dist(
+            input_image,
+            rollouts.recurrent_hidden_states[0].view(
+                -1, self.actor_critic.recurrent_hidden_state_size),
+            rollouts.masks[:-1].view(-1, 1),
+            rollouts.actions.view(-1, action_shape))
+
+        values = values.view(num_steps, num_processes, 1)
+        action_log_probs = action_log_probs.view(num_steps, num_processes, 1)
+        advantages = rollouts.returns[:-1] - values
+        action_loss = -(advantages.detach() * action_log_probs).mean()
+
+        action_loss.backward()
+	    
+        # for name, parms in self.actor_critic.named_parameters():
+        #     print('-->name:', name, '-->grad_requirs:',parms.requires_grad,' -->grad_value:',parms.grad)
+
+        # print('action loss',action_loss)
+        # # import pdb;pdb.set_trace()
+        obs_grad = input_image.grad
+        obs_grad.requires_grad_()
+        # obs_grad.retain_grad()
+        grads = obs_grad.reshape(5,16,4,84,84)
+        
+        # print('grad',saliency.sum())
+        return grads, input_image, rollouts.obs
